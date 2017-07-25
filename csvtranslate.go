@@ -12,6 +12,8 @@ import (
 
 	"errors"
 
+	"time"
+
 	"cloud.google.com/go/translate"
 	"golang.org/x/net/context"
 	"golang.org/x/text/language"
@@ -68,64 +70,95 @@ type transPair struct {
 // TranslateCSV translates CSV file into target language.
 // Takes column numbers to translate.
 func (ext *ExcelTrans) TranslateCSV(cols ...int) error {
+
+	now := time.Now()
+	fmt.Println("Start")
 	if ext.toDir == "" {
+		fmt.Println("Error at no toDir")
+
 		return errors.New("Use SetToDirectory()")
 	}
 	defer ext.file.Close()
-	transCols := make(chan transPair)
-	done := make(chan bool)
+	csvLock := sync.Mutex{}
 	csvReader := csv.NewReader(ext.file)
 	csvR, err := csvReader.ReadAll()
 	if err != nil {
-		return err
+		log.Panicln(err)
 	}
 
-	trans, err := newTranslate(ext.source)
+	trans1, err := newTranslate(ext.source)
 	if err != nil {
-		return err
-	}
-	wg.Add(len(cols))
-	go func() {
-		wg.Wait()
-		done <- true
-	}()
+		log.Panicln(err)
 
+	}
+
+	if cols[0] == -1 {
+		var newCols []int
+		for r := 0; r < len(csvR[0]); r++ {
+			newCols = append(newCols, r+1)
+		}
+		cols = newCols
+	}
+
+	limiter := make(chan bool, 100)
+	csvRcp := csvR
+	goCount := 0
 	for _, col := range cols {
-		go func(csvr [][]string, c int, tp chan transPair) {
-			defer wg.Done()
-			myCol := []string{}
-			for _, row := range csvr {
-				myCol = append(myCol, row[c-1])
+		for i, row := range csvRcp {
+			goCount++
+
+			sizeRow := len(row[col-1])
+			if sizeRow == 0 {
+				continue
 			}
-			trans, err := trans.translate(myCol, ext.target)
+			wg.Add(1)
+			limiter <- true
+			go func(row []string, c int, r int, count int) {
+				defer wg.Done()
+				defer func() { <-limiter }()
+				var trans []string
+				for i := 0; i < 5; i++ {
+					trans, err = trans1.translate([]string{row[c-1]}, ext.target)
+					if err != nil {
+						if i == 4 {
+							log.Panicln(err)
+						}
+						d := time.Duration(250 * (i + 1))
+						time.Sleep(d * time.Millisecond)
+						fmt.Printf("[Goroutine %v] Retry #%v\n", count, i+1)
+						continue
+					}
+					break
+				}
+				csvLock.Lock()
 
-			tp <- transPair{c - 1, trans, err}
+				csvR[r][c-1] = trans[0]
 
-		}(csvR, col, transCols)
-	}
+				csvLock.Unlock()
 
-	for {
-		select {
-		case t := <-transCols:
-			for i, j := range t.tranlated {
-				csvR[i][t.spot] = j
-			}
-		case <-done:
-			fName := ext.toDir
-			fmt.Println(fName)
-			file, err := os.Create(fName)
-			if err != nil {
-				log.Panicln(err)
-			}
-			defer file.Close()
+			}(row, col, i, goCount)
+			rate := time.Duration(sizeRow)
+			time.Sleep(rate * time.Millisecond)
 
-			writer := csv.NewWriter(file)
-			defer writer.Flush()
-
-			writer.WriteAll(csvR)
-			return nil
 		}
 	}
+	wg.Wait()
+
+	fName := ext.toDir
+
+	file, err := os.Create(fName)
+	if err != nil {
+		log.Panicln(err)
+	}
+	defer file.Close()
+
+	writer := csv.NewWriter(file)
+	defer writer.Flush()
+
+	writer.WriteAll(csvR)
+	fmt.Println(goCount)
+	fmt.Println(time.Since(now))
+	return nil
 
 }
 
@@ -170,6 +203,7 @@ func (t *transKU) translate(inputs []string, target language.Tag) ([]string, err
 		return nil, err
 	}
 	lang := []string{}
+
 	for _, t := range trans {
 		lang = append(lang, t.Text)
 	}
